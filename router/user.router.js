@@ -5,6 +5,7 @@ import {
   getProductByCategory,
   searchProducts,
   getCategories,
+  getStoreConfig,
   getProductReviews,
   addProductReview,
   listWishlist,
@@ -36,6 +37,7 @@ router.get("/get-product-byid/:id", getProductById);
 router.get("/get-product-byCategory/:category", getProductByCategory);
 router.post("/search", searchProducts);
 router.get("/get-categories", getCategories);
+router.get("/store-config", getStoreConfig);
 router.get("/get-product-reviews/:id", getProductReviews);
 router.post("/product-reviews", upload.single("reviewImage"), addProductReview);
 router.post("/wishlist/list", listWishlist);

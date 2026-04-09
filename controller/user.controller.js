@@ -1,4 +1,5 @@
 import Products from "../model/product.model.js";
+import mongoose from "mongoose";
 import { Catagories } from "../model/catagory.model.js";
 import Reviews from "../model/review.model.js";
 import Addresses from "../model/addresses.model.js";
@@ -7,11 +8,633 @@ import { uploadToCloudinary } from "../config/cloudinary.js";
 import Profile from "../model/profile.model.js";
 import Wishlist from "../model/wishlist.model.js";
 import Orders from "../model/orders.model.js";
+import StoreSettings from "../model/storeSettings.model.js";
+import CartState from "../model/cartState.model.js";
 
 const parsePageLimit = (req) => {
   const page = Math.max(parseInt(req.query.page || "1", 10), 1);
   const limit = Math.max(Math.min(parseInt(req.query.limit || "12", 10), 100), 1);
   return { page, limit };
+};
+
+const cleanUrl = (value) => {
+  const text = String(value || "").trim();
+  if (!text || text === "#") return "";
+  return text;
+};
+
+const resolveStoreId = (req) =>
+  String(
+    req.headers["x-store-id"] ||
+    req.query?.storeId ||
+    req.body?.storeId ||
+    process.env.DEFAULT_STORE_ID ||
+    process.env.STORE_ID ||
+    "default-store"
+  ).trim();
+
+const shapeStoreConfig = (doc, storeId) => {
+  const resolvedStoreId = String(doc?.storeId || storeId || "default-store").trim() || "default-store";
+  const storeName = String(doc?.storeName || "").trim();
+  const navbarTitle = String(doc?.navbarTitle || "").trim() || storeName;
+  const footerTitle = String(doc?.footerTitle || "").trim() || storeName;
+  const currencySymbol =
+    String(doc?.currencySymbol ?? doc?.currency ?? doc?.currency_symbol ?? "₹").trim() || "₹";
+  return {
+    storeId: resolvedStoreId,
+    storeName: storeName || navbarTitle || footerTitle || "Store",
+    navbarTitle: navbarTitle || storeName || "Store",
+    footerTitle: footerTitle || storeName || "Store",
+    footerDescription: String(doc?.footerDescription || "").trim(),
+    email: String(doc?.companyEmail || doc?.email || "").trim(),
+    phone: String(doc?.phone || "").trim(),
+    address: String(doc?.companyAddress || doc?.address || "").trim(),
+    currencySymbol,
+    social: {
+      instagramUrl: cleanUrl(doc?.instagramUrl ?? doc?.instagram_url),
+      facebookUrl: cleanUrl(doc?.facebookUrl ?? doc?.facebook_url),
+      twitterUrl: cleanUrl(doc?.twitterUrl ?? doc?.twitter_url),
+      youtubeUrl: cleanUrl(doc?.youtubeUrl ?? doc?.youtube_url),
+      linkedinUrl: cleanUrl(doc?.linkedinUrl ?? doc?.linkedin_url),
+    },
+  };
+};
+
+const findStoreSettingsFromRawCollections = async (storeId) => {
+  const db = mongoose.connection?.db;
+  if (!db) return null;
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  if (!names.length) return null;
+
+  const preferred = [
+    "storesettings",
+    "store_settings",
+    "storeSettings",
+    "storeconfigs",
+    "store_configs",
+    "storeprofiles",
+    "store_profiles",
+  ];
+
+  const byPreference = preferred
+    .map((name) => names.find((entry) => entry.toLowerCase() === name.toLowerCase()))
+    .filter(Boolean);
+
+  const inferred = names.filter((entry) => /store/i.test(entry));
+  const candidates = Array.from(new Set([...byPreference, ...inferred]));
+
+  for (const collectionName of candidates) {
+    const collection = db.collection(collectionName);
+    const exact = await collection.findOne({ storeId });
+    if (exact) return exact;
+    const latest = await collection.find({}).sort({ updatedAt: -1, createdAt: -1 }).limit(1).next();
+    if (latest) return latest;
+  }
+
+  return null;
+};
+
+const findProductFromRawCollections = async ({ idParam, numericId }) => {
+  const db = mongoose.connection?.db;
+  if (!db) return null;
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter((name) => /product/i.test(name));
+  if (!names.length) return null;
+
+  for (const collectionName of names) {
+    const collection = db.collection(collectionName);
+
+    if (Number.isFinite(numericId) && numericId > 0) {
+      const byNumeric = await collection.findOne({
+        $or: [{ product_id: numericId }, { productId: numericId }],
+      });
+      if (byNumeric) return byNumeric;
+    }
+
+    if (mongoose.Types.ObjectId.isValid(idParam)) {
+      const byObjectId = await collection.findOne({ _id: new mongoose.Types.ObjectId(idParam) });
+      if (byObjectId) return byObjectId;
+    }
+  }
+
+  return null;
+};
+
+const shapeLegacyProduct = (raw = {}) => {
+  const productId = Number(raw?.product_id ?? raw?.productId ?? 0);
+  const images = Array.isArray(raw?.product_image)
+    ? raw.product_image
+    : Array.isArray(raw?.media?.images)
+      ? raw.media.images
+      : Array.isArray(raw?.images)
+        ? raw.images
+        : [];
+
+  const mrp = Number(raw?.price ?? raw?.mrp ?? 0) || 0;
+  const selling = Number(raw?.selling_price ?? raw?.salePrice ?? raw?.discountedPrice ?? mrp) || mrp;
+
+  return {
+    ...raw,
+    product_id: productId > 0 ? productId : undefined,
+    name: String(raw?.name || raw?.title || "").trim(),
+    title: String(raw?.title || raw?.name || "").trim(),
+    price: mrp,
+    selling_price: selling,
+    product_image: images,
+    catagory_id: raw?.catagory_id || raw?.categoryId || raw?.category_id || "",
+    category: String(raw?.category || raw?.categoryName || raw?.Catagory?.name || "").trim(),
+  };
+};
+
+const toPositiveNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+const escapeRegex = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const ORDER_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+const buildRandomPublicOrderId = () => {
+  const letterCount = 4 + Math.floor(Math.random() * 2); // 4 or 5 chars
+  let letters = "";
+  for (let i = 0; i < letterCount; i += 1) {
+    letters += ORDER_ID_ALPHABET[Math.floor(Math.random() * ORDER_ID_ALPHABET.length)];
+  }
+  const digits = String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
+  return `${letters}-${digits}`;
+};
+
+const normalizePaymentStatus = (value) => {
+  const raw = String(value || "").toLowerCase();
+  if (!raw) return "pending";
+  if (["captured", "paid", "authorized"].includes(raw)) return "paid";
+  if (["failed", "cancelled"].includes(raw)) return raw;
+  return raw;
+};
+
+const normalizeTenantOrderDoc = (doc, productLookup = new Map(), productLookupByRef = new Map()) => {
+  const items = Array.isArray(doc?.items)
+    ? doc.items.map((item) => {
+      const productId = Number(item?.product_id ?? item?.productId ?? 0);
+      const productRef = String(item?.product || item?.productRef || "").trim();
+      const productDoc = productLookup.get(productId) || productLookupByRef.get(productRef);
+      const qty = Math.max(1, Number(item?.quantity ?? item?.qty ?? 1) || 1);
+      const directPrice = toPositiveNumber(item?.price ?? item?.unitPrice ?? item?.unit_price);
+      const lineTotal = toPositiveNumber(item?.lineTotal ?? item?.line_total);
+      const resolvedPrice = directPrice || (lineTotal && qty ? lineTotal / qty : 0);
+      const mediaImage = Array.isArray(productDoc?.media?.images) ? productDoc.media.images[0] : "";
+      const productImage = Array.isArray(productDoc?.product_image)
+        ? productDoc.product_image[0]
+        : productDoc?.product_image || mediaImage || "";
+
+      return {
+        product_id: productId || undefined,
+        product: item?.product || item?.productRef,
+        quantity: qty,
+        price: resolvedPrice,
+        title: String(item?.title || item?.nameSnapshot || item?.name || productDoc?.title || productDoc?.name || "").trim(),
+        image: String(item?.image || item?.imageSnapshot || productImage || "").trim(),
+        color: String(item?.color || "").trim(),
+        size: String(item?.size || "").trim(),
+      };
+    })
+    : [];
+
+  const pricingTotal = toPositiveNumber(doc?.pricing?.total);
+  const fallbackItemsTotal = items.reduce(
+    (sum, item) => sum + toPositiveNumber(item?.price) * (Number(item?.quantity) || 1),
+    0
+  );
+  const rawAmount = toPositiveNumber(pricingTotal || doc?.amount);
+  const amount =
+    rawAmount && rawAmount > 1000 && fallbackItemsTotal > 0 && rawAmount / 100 === fallbackItemsTotal
+      ? rawAmount / 100
+      : rawAmount;
+
+  const rawOrderId =
+    doc?.order_id ?? doc?.orderId ?? doc?.order_code ?? doc?.orderCode ?? doc?._id;
+  const orderId = String(rawOrderId || "").trim() || undefined;
+
+  return {
+    _id: doc?._id,
+    order_id: orderId,
+    status: doc?.status || doc?.fulfillment?.status || "pending",
+    payment_status: doc?.payment_status || normalizePaymentStatus(doc?.payment?.status),
+    payment_method: doc?.payment_method || doc?.payment?.provider || "Razorpay",
+    amount: amount || fallbackItemsTotal,
+    currency: doc?.currency || doc?.pricing?.currency || "INR",
+    razorpay_order_id: doc?.razorpay_order_id || doc?.payment?.paymentOrderId || "",
+    razorpay_payment_id: doc?.razorpay_payment_id || doc?.payment?.paymentId || "",
+    razorpay_signature: doc?.razorpay_signature || doc?.payment?.signature || "",
+    items,
+    user_email: doc?.user_email || doc?.customerEmail || "",
+    FullName: doc?.FullName || doc?.shippingAddress?.fullName || "",
+    phone1: doc?.phone1 || doc?.shippingAddress?.phone || "",
+    phone2: doc?.phone2 || "",
+    address_line1: doc?.address_line1 || doc?.shippingAddress?.line1 || "",
+    city: doc?.city || doc?.shippingAddress?.city || "",
+    state: doc?.state || doc?.shippingAddress?.state || "",
+    country: doc?.country || doc?.shippingAddress?.country || "",
+    pinCode: doc?.pinCode || doc?.shippingAddress?.postalCode || "",
+    addressType: doc?.addressType || "",
+    createdAt: doc?.createdAt,
+    updatedAt: doc?.updatedAt,
+    _source: "tenant",
+  };
+};
+
+const getTenantOrdersFromCollections = async (email) => {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  if (!safeEmail) return [];
+
+  const db = mongoose.connection?.db;
+  if (!db) return [];
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  if (!names.length) return [];
+
+  const byLower = new Map(names.map((name) => [name.toLowerCase(), name]));
+  const preferred = ["tenantorders", "storeorders", "tenantorder", "storeorder"];
+  const candidates = preferred
+    .map((name) => byLower.get(name.toLowerCase()))
+    .filter(Boolean);
+  if (!candidates.length) return [];
+
+  const emailRegex = new RegExp(`^${escapeRegex(safeEmail)}$`, "i");
+
+  const allDocs = [];
+  for (const name of candidates) {
+    const docs = await db
+      .collection(name)
+      .find({
+        $or: [
+          { user_email: emailRegex },
+          { customerEmail: emailRegex },
+          { email: emailRegex },
+          { customer_email: emailRegex },
+          { "customer.email": emailRegex },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+    allDocs.push(...docs);
+  }
+
+  const dedupedDocs = [];
+  const seen = new Set();
+  for (const doc of allDocs) {
+    const key = String(doc?._id || doc?.order_id || doc?.orderId || "").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    dedupedDocs.push(doc);
+  }
+
+  dedupedDocs.sort((a, b) => {
+    const aTime = new Date(a?.createdAt || 0).getTime();
+    const bTime = new Date(b?.createdAt || 0).getTime();
+    return bTime - aTime;
+  });
+
+  const productIds = Array.from(
+    new Set(
+      dedupedDocs
+        .flatMap((doc) => (Array.isArray(doc?.items) ? doc.items : []))
+        .map((item) => Number(item?.product_id ?? item?.productId ?? 0))
+        .filter((id) => Number.isFinite(id) && id > 0)
+    )
+  );
+
+  const productRefIds = Array.from(
+    new Set(
+      dedupedDocs
+        .flatMap((doc) => (Array.isArray(doc?.items) ? doc.items : []))
+        .map((item) => String(item?.product || item?.productRef || "").trim())
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    )
+  ).map((id) => new mongoose.Types.ObjectId(id));
+
+  const productLookup = new Map();
+  const productLookupByRef = new Map();
+
+  if (db && (productIds.length || productRefIds.length)) {
+    const productCollectionNames = names
+      .filter((name) => /product/i.test(name));
+
+    for (const collectionName of productCollectionNames) {
+      const filter = {
+        $or: [
+          ...(productIds.length ? [{ product_id: { $in: productIds } }, { productId: { $in: productIds } }] : []),
+          ...(productRefIds.length ? [{ _id: { $in: productRefIds } }] : []),
+        ],
+      };
+      if (!filter.$or.length) continue;
+
+      const docs = await db
+        .collection(collectionName)
+        .find(filter)
+        .project({ product_id: 1, productId: 1, title: 1, name: 1, product_image: 1, media: 1 })
+        .toArray();
+
+      docs.forEach((doc) => {
+        const pid = Number(doc?.product_id ?? doc?.productId ?? 0);
+        if (pid > 0 && !productLookup.has(pid)) {
+          productLookup.set(pid, doc);
+        }
+        const ref = String(doc?._id || "").trim();
+        if (ref && !productLookupByRef.has(ref)) {
+          productLookupByRef.set(ref, doc);
+        }
+      });
+    }
+  }
+
+  return dedupedDocs.map((doc) => normalizeTenantOrderDoc(doc, productLookup, productLookupByRef));
+};
+
+const TENANT_ORDER_COLLECTION_PREFERENCE = [
+  "tenantorders",
+  "storeorders",
+  "tenantorder",
+  "storeorder",
+];
+
+const resolveTenantOrderCollectionName = async () => {
+  const db = mongoose.connection?.db;
+  if (!db) throw new Error("Database not connected");
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  const byLower = new Map(names.map((name) => [name.toLowerCase(), name]));
+
+  for (const preferredName of TENANT_ORDER_COLLECTION_PREFERENCE) {
+    const resolvedName = byLower.get(preferredName.toLowerCase());
+    if (resolvedName) return resolvedName;
+  }
+
+  return TENANT_ORDER_COLLECTION_PREFERENCE[0];
+};
+
+const doesPublicOrderIdExist = async (publicOrderId) => {
+  const db = mongoose.connection?.db;
+  if (!db) return false;
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  const candidates = Array.from(
+    new Set([...TENANT_ORDER_COLLECTION_PREFERENCE, "orders", ...names.filter((name) => /order/i.test(name))])
+  );
+
+  for (const name of candidates) {
+    if (!names.some((entry) => entry.toLowerCase() === String(name).toLowerCase())) continue;
+    const collectionName = names.find((entry) => entry.toLowerCase() === String(name).toLowerCase()) || name;
+    const match = await db.collection(collectionName).findOne({
+      $or: [
+        { order_id: publicOrderId },
+        { orderId: publicOrderId },
+        { order_code: publicOrderId },
+        { orderCode: publicOrderId },
+      ],
+    });
+    if (match) return true;
+  }
+  return false;
+};
+
+const generateUniquePublicOrderId = async (maxAttempts = 30) => {
+  for (let i = 0; i < maxAttempts; i += 1) {
+    const candidate = buildRandomPublicOrderId();
+    const exists = await doesPublicOrderIdExist(candidate);
+    if (!exists) return candidate;
+  }
+  throw new Error("Unable to generate unique order id");
+};
+
+const insertTenantOrder = async ({
+  req,
+  publicOrderId,
+  razorpayOrder,
+  payload,
+  orderItems,
+  addressDoc,
+  email,
+}) => {
+  const db = mongoose.connection?.db;
+  if (!db) throw new Error("Database not connected");
+
+  const collectionName = await resolveTenantOrderCollectionName();
+  const storeId = resolveStoreId(req);
+  const amountRupees = Math.round(Number(payload?.amount || 0) / 100);
+  const orderCode = publicOrderId;
+  const now = new Date();
+
+  const shippingAddress = {
+    fullName: addressDoc?.FullName || addressDoc?.full_name || "",
+    line1: addressDoc?.address_line1 || addressDoc?.address || "",
+    city: addressDoc?.city || "",
+    state: addressDoc?.state || "",
+    country: addressDoc?.country || "India",
+    postalCode: addressDoc?.pinCode || addressDoc?.postal_code || "",
+    phone: addressDoc?.phone1 || addressDoc?.phone || "",
+  };
+
+  const items = orderItems.map((item) => {
+    const qty = Math.max(1, Number(item?.quantity ?? item?.qty ?? 1) || 1);
+    const unitPrice = toPositiveNumber(item?.price);
+    return {
+      ...item,
+      qty,
+      quantity: qty,
+      price: unitPrice,
+      lineTotal: unitPrice * qty,
+    };
+  });
+
+  const tenantOrderDoc = {
+    storeId,
+    source: "legacy-user-create-order",
+    orderId: publicOrderId,
+    order_id: publicOrderId,
+    orderCode,
+    order_code: orderCode,
+    status: "pending",
+    fulfillment: {
+      status: "new",
+    },
+    payment_status: "created",
+    payment_method: "Razorpay",
+    payment: {
+      provider: "razorpay",
+      status: "created",
+      paymentOrderId: razorpayOrder?.id || "",
+    },
+    amount: amountRupees,
+    currency: payload?.currency || "INR",
+    pricing: {
+      subtotal: amountRupees,
+      discount: 0,
+      shipping: 0,
+      tax: 0,
+      total: amountRupees,
+      currency: payload?.currency || "INR",
+    },
+    razorpay_order_id: razorpayOrder?.id || "",
+    razorpay_payment_id: "",
+    razorpay_signature: "",
+    items,
+    user_email: email || "",
+    customerEmail: email || "",
+    customer: {
+      email: email || "",
+    },
+    FullName: shippingAddress.fullName,
+    phone1: shippingAddress.phone,
+    phone2: addressDoc?.phone2 || addressDoc?.alt_phone || "",
+    address_line1: shippingAddress.line1,
+    city: shippingAddress.city,
+    state: shippingAddress.state,
+    country: shippingAddress.country,
+    pinCode: shippingAddress.postalCode,
+    addressType: addressDoc?.addressType || "",
+    shippingAddress,
+    billingAddress: shippingAddress,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await db.collection(collectionName).insertOne(tenantOrderDoc);
+  return { collectionName, orderCode };
+};
+
+const markTenantOrderPaymentCaptured = async ({
+  razorpay_order_id,
+  razorpay_payment_id,
+  razorpay_signature,
+}) => {
+  const db = mongoose.connection?.db;
+  if (!db) return null;
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  const byLower = new Map(names.map((name) => [name.toLowerCase(), name]));
+  const candidates = TENANT_ORDER_COLLECTION_PREFERENCE
+    .map((name) => byLower.get(name.toLowerCase()))
+    .filter(Boolean);
+
+  if (!candidates.length) return null;
+
+  const lookupFilter = {
+    $or: [
+      { razorpay_order_id },
+      { "payment.paymentOrderId": razorpay_order_id },
+    ],
+  };
+
+  for (const collectionName of candidates) {
+    const collection = db.collection(collectionName);
+    const existing = await collection.findOne(lookupFilter);
+    if (!existing) continue;
+
+    await collection.updateOne(
+      { _id: existing._id },
+      {
+        $set: {
+          status: "confirmed",
+          payment_status: "paid",
+          razorpay_payment_id,
+          razorpay_signature,
+          "fulfillment.status": "confirmed",
+          "payment.status": "captured",
+          "payment.paymentId": razorpay_payment_id,
+          "payment.signature": razorpay_signature,
+          "payment.paidAt": new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    const updated = await collection.findOne({ _id: existing._id });
+    if (!updated) return null;
+    return {
+      order: updated,
+      collectionName,
+    };
+  }
+
+  return null;
+};
+
+const cancelTenantOrderIfExists = async (idStr) => {
+  const db = mongoose.connection?.db;
+  if (!db) return null;
+
+  const listed = await db.listCollections({}, { nameOnly: true }).toArray();
+  const names = listed.map((item) => String(item?.name || "")).filter(Boolean);
+  const byLower = new Map(names.map((name) => [name.toLowerCase(), name]));
+  const candidates = TENANT_ORDER_COLLECTION_PREFERENCE
+    .map((name) => byLower.get(name.toLowerCase()))
+    .filter(Boolean);
+  if (!candidates.length) return null;
+
+  const isNumericId = !Number.isNaN(Number(idStr)) && Number.isFinite(Number(idStr));
+  const numericId = Number(idStr);
+  const tenantFilters = [];
+  if (isNumericId) {
+    tenantFilters.push({ order_id: numericId });
+    tenantFilters.push({ orderId: numericId });
+  }
+  tenantFilters.push({ order_id: idStr });
+  tenantFilters.push({ orderId: idStr });
+  tenantFilters.push({ order_code: idStr });
+  tenantFilters.push({ orderCode: idStr });
+  if (mongoose.Types.ObjectId.isValid(idStr)) {
+    tenantFilters.push({ _id: new mongoose.Types.ObjectId(idStr) });
+  }
+  tenantFilters.push({ _id: idStr });
+
+  for (const collectionName of candidates) {
+    const collection = db.collection(collectionName);
+    const existing = await collection.findOne({ $or: tenantFilters });
+    if (!existing) continue;
+
+    const finalStatuses = ["cancelled", "rejected", "delivered", "rto"];
+    const currentStatus = String(existing?.status || existing?.fulfillment?.status || "").toLowerCase();
+    if (finalStatuses.includes(currentStatus)) {
+      return {
+        blocked: true,
+        message: `Order already ${existing.status || currentStatus}`,
+      };
+    }
+
+    const paidStatus = normalizePaymentStatus(existing?.payment_status || existing?.payment?.status) === "paid";
+    const nextPaymentStatus = paidStatus ? "refund_pending" : "cancelled";
+
+    await collection.updateOne(
+      { _id: existing._id },
+      {
+        $set: {
+          status: "cancelled",
+          payment_status: nextPaymentStatus,
+          "fulfillment.status": "cancelled",
+          "payment.status": nextPaymentStatus,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    const updated = await collection.findOne({ _id: existing._id });
+    return {
+      blocked: false,
+      order: updated,
+      collectionName,
+    };
+  }
+
+  return null;
 };
 
 export const showProducts = async (req, res) => {
@@ -22,7 +645,6 @@ export const showProducts = async (req, res) => {
       .sort({ product_id: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
-
     return res.status(200).json({
       status: true,
       products,
@@ -34,27 +656,63 @@ export const showProducts = async (req, res) => {
   }
 };
 
+export const getStoreConfig = async (req, res) => {
+  try {
+    const storeId = resolveStoreId(req);
+    let settings = await StoreSettings.findOne({ storeId }).lean();
+    if (!settings) {
+      settings = await StoreSettings.findOne({}).sort({ updatedAt: -1 }).lean();
+    }
+    if (!settings) {
+      settings = await findStoreSettingsFromRawCollections(storeId);
+    }
+    return res.status(200).json({
+      status: true,
+      data: shapeStoreConfig(settings || {}, storeId),
+    });
+  } catch (error) {
+    console.error("getStoreConfig error:", error);
+    return res.status(500).json({ status: false, message: "Failed to load store config" });
+  }
+};
+
 export const getProductById = async (req, res) => {
   try {
     const idParam = req.params.id;
-    const product =
-      (await Products.findOne({ product_id: Number(idParam) })) ||
-      (await Products.findById(idParam));
+    const numericId = Number(idParam);
+
+    let product = null;
+    if (Number.isFinite(numericId) && numericId > 0) {
+      product = await Products.findOne({ product_id: numericId });
+    }
+    if (!product && mongoose.Types.ObjectId.isValid(idParam)) {
+      product = await Products.findById(idParam);
+    }
+
+    if (!product) {
+      product = await findProductFromRawCollections({ idParam, numericId });
+    }
 
     if (!product) {
       return res
         .status(200)
         .json({ status: 404, data: [], message: "Product not found" });
     }
-    const cat =
-      product.catagory_id &&
-      (await Catagories.findById(product.catagory_id).lean());
 
-    const shaped = {
-      ...product.toObject(),
-      catagory_id: 1, // legacy numeric fallback
-      Catagory: cat ? { id: 1, name: cat.name } : undefined,
-    };
+    const productObj = typeof product?.toObject === "function" ? product.toObject() : product;
+    const shaped = shapeLegacyProduct(productObj);
+
+    const categoryId = String(shaped?.catagory_id || "").trim();
+    const cat =
+      categoryId && mongoose.Types.ObjectId.isValid(categoryId)
+        ? await Catagories.findById(categoryId).lean()
+        : null;
+
+    if (cat) {
+      shaped.Catagory = { id: 1, name: cat.name };
+    } else if (shaped.category) {
+      shaped.Catagory = { id: 1, name: shaped.category };
+    }
 
     return res.status(200).json({ status: 200, data: [shaped] });
   } catch (error) {
@@ -233,32 +891,216 @@ export const getProductReviews = async (req, res) => {
 };
 
 // --- Minimal user/cart/address stubs to satisfy frontend ---
-export const getUserCart = async (_req, res) => {
-  return res.status(200).json([]);
+const makeCartId = () => `cart_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+const normalizeCartItem = (item = {}) => {
+  const productId = Number(item?.product_id ?? item?.productId ?? 0);
+  const qty = Math.max(1, Number(item?.qty ?? item?.quantity ?? 1) || 1);
+  const price = Number(item?.price || 0) || 0;
+  const mrp = Number(item?.mrp ?? item?.price ?? 0) || 0;
+  return {
+    product_id: productId,
+    qty,
+    price,
+    mrp,
+    title: String(item?.title || "").trim(),
+    image: String(item?.image || "").trim(),
+    color: String(item?.color || "").trim(),
+    size: String(item?.size || "").trim(),
+  };
 };
 
-export const saveUserCart = async (_req, res) => {
-  return res
-    .status(200)
-    .json({ status: true, message: "Cart saved (stub, not persisted)" });
+const findCartById = async (cartId) => {
+  const safeId = String(cartId || "").trim();
+  if (!safeId) return null;
+  return CartState.findOne({ cart_id: safeId });
 };
 
-export const addToCart = async (_req, res) => {
-  return res
-    .status(200)
-    .json({ status: true, message: "Added to cart (stub, not persisted)" });
+const ensureCart = async (cartIdFromReq) => {
+  const existing = await findCartById(cartIdFromReq);
+  if (existing) return existing;
+
+  const desiredId = String(cartIdFromReq || "").trim() || makeCartId();
+  const created = await CartState.create({ cart_id: desiredId, items: [] });
+  return created;
 };
 
-export const removeCartByProduct = async (_req, res) => {
-  return res.status(200).json({ status: true, message: "Removed (stub)" });
+const toCartResponse = (cartDoc) => ({
+  status: true,
+  cart_id: cartDoc?.cart_id || "",
+  items: Array.isArray(cartDoc?.items) ? cartDoc.items : [],
+});
+
+export const getUserCart = async (req, res) => {
+  try {
+    const cartId = String(req.body?.cart_id || req.body?.cartId || "").trim();
+    if (!cartId) {
+      return res.status(200).json({ status: true, cart_id: "", items: [] });
+    }
+
+    const cart = await findCartById(cartId);
+    if (!cart) {
+      return res.status(200).json({ status: true, cart_id: cartId, items: [] });
+    }
+
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("getUserCart error:", error);
+    return res.status(500).json({ status: false, message: "Failed to load cart" });
+  }
 };
 
-export const updateCartItem = async (_req, res) => {
-  return res.status(200).json({ status: true, message: "Updated (stub)" });
+export const saveUserCart = async (req, res) => {
+  try {
+    const cartId = String(req.body?.cart_id || req.body?.cartId || "").trim();
+    const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = incoming
+      .map(normalizeCartItem)
+      .filter((item) => Number.isFinite(item.product_id) && item.product_id > 0);
+
+    const cart = await ensureCart(cartId);
+    cart.items = items;
+    await cart.save();
+
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("saveUserCart error:", error);
+    return res.status(500).json({ status: false, message: "Failed to save cart" });
+  }
 };
 
-export const clearCart = async (_req, res) => {
-  return res.status(200).json({ status: true, message: "Cleared (stub)" });
+export const addToCart = async (req, res) => {
+  try {
+    const payload = normalizeCartItem(req.body || {});
+    if (!Number.isFinite(payload.product_id) || payload.product_id <= 0) {
+      return res.status(400).json({ status: false, message: "product_id required" });
+    }
+
+    const cartId = String(req.body?.cart_id || req.body?.cartId || "").trim();
+    const cart = await ensureCart(cartId);
+
+    const matchIndex = (cart.items || []).findIndex(
+      (item) =>
+        Number(item?.product_id) === payload.product_id &&
+        String(item?.color || "").trim().toLowerCase() === payload.color.toLowerCase() &&
+        String(item?.size || "").trim().toUpperCase() === payload.size.toUpperCase()
+    );
+
+    if (matchIndex >= 0) {
+      cart.items[matchIndex].qty = Math.max(1, Number(cart.items[matchIndex].qty || 1)) + payload.qty;
+      cart.items[matchIndex].price = payload.price || cart.items[matchIndex].price || 0;
+      cart.items[matchIndex].mrp = payload.mrp || cart.items[matchIndex].mrp || payload.price || 0;
+      if (payload.title) cart.items[matchIndex].title = payload.title;
+      if (payload.image) cart.items[matchIndex].image = payload.image;
+    } else {
+      cart.items.push(payload);
+    }
+
+    await cart.save();
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("addToCart error:", error);
+    return res.status(500).json({ status: false, message: "Failed to add to cart" });
+  }
+};
+
+export const removeCartByProduct = async (req, res) => {
+  try {
+    const cartId = String(req.query?.cart_id || req.query?.cartId || "").trim();
+    const productId = Number(req.params?.productId || 0);
+    if (!cartId) {
+      return res.status(400).json({ status: false, message: "cart_id required" });
+    }
+    if (!Number.isFinite(productId) || productId <= 0) {
+      return res.status(400).json({ status: false, message: "productId required" });
+    }
+
+    const color = String(req.query?.color || "").trim().toLowerCase();
+    const size = String(req.query?.size || "").trim().toUpperCase();
+    const cart = await findCartById(cartId);
+    if (!cart) {
+      return res.status(200).json({ status: true, cart_id: cartId, items: [] });
+    }
+
+    cart.items = (cart.items || []).filter((item) => {
+      const sameProduct = Number(item?.product_id) === productId;
+      if (!sameProduct) return true;
+      if (!color && !size) return false;
+      const sameColor = String(item?.color || "").trim().toLowerCase() === color;
+      const sameSize = String(item?.size || "").trim().toUpperCase() === size;
+      return !(sameColor && sameSize);
+    });
+
+    await cart.save();
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("removeCartByProduct error:", error);
+    return res.status(500).json({ status: false, message: "Failed to remove item" });
+  }
+};
+
+export const updateCartItem = async (req, res) => {
+  try {
+    const cartId = String(req.body?.cart_id || req.body?.cartId || "").trim();
+    const productId = Number(req.body?.product_id || req.body?.productId || 0);
+    const nextQty = Math.max(0, Number(req.body?.qty ?? req.body?.quantity ?? 0) || 0);
+
+    if (!cartId) {
+      return res.status(400).json({ status: false, message: "cart_id required" });
+    }
+    if (!Number.isFinite(productId) || productId <= 0) {
+      return res.status(400).json({ status: false, message: "product_id required" });
+    }
+
+    const color = String(req.body?.color || "").trim().toLowerCase();
+    const size = String(req.body?.size || "").trim().toUpperCase();
+    const cart = await findCartById(cartId);
+    if (!cart) {
+      return res.status(200).json({ status: true, cart_id: cartId, items: [] });
+    }
+
+    const matchIndex = (cart.items || []).findIndex(
+      (item) =>
+        Number(item?.product_id) === productId &&
+        String(item?.color || "").trim().toLowerCase() === color &&
+        String(item?.size || "").trim().toUpperCase() === size
+    );
+
+    if (matchIndex >= 0) {
+      if (nextQty <= 0) {
+        cart.items.splice(matchIndex, 1);
+      } else {
+        cart.items[matchIndex].qty = nextQty;
+      }
+      await cart.save();
+    }
+
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("updateCartItem error:", error);
+    return res.status(500).json({ status: false, message: "Failed to update item" });
+  }
+};
+
+export const clearCart = async (req, res) => {
+  try {
+    const cartId = String(req.body?.cart_id || req.body?.cartId || "").trim();
+    if (!cartId) {
+      return res.status(200).json({ status: true, cart_id: "", items: [] });
+    }
+
+    const cart = await findCartById(cartId);
+    if (!cart) {
+      return res.status(200).json({ status: true, cart_id: cartId, items: [] });
+    }
+
+    cart.items = [];
+    await cart.save();
+    return res.status(200).json(toCartResponse(cart));
+  } catch (error) {
+    console.error("clearCart error:", error);
+    return res.status(500).json({ status: false, message: "Failed to clear cart" });
+  }
 };
 
 export const getUserProfile = async (req, res) => {
@@ -368,13 +1210,28 @@ export const clearWishlistDb = async (req, res) => {
 export const getUserOrders = async (req, res) => {
   try {
     const email = (req.body?.email || "").trim();
+    if (!email) {
+      return res.status(400).json({ status: false, message: "email required" });
+    }
+
+    const tenantOrders = await getTenantOrdersFromCollections(email);
+    if (tenantOrders.length) {
+      return res.status(200).json({ status: true, orders: tenantOrders });
+    }
+
     const filter = email ? { user_email: email } : {};
-    const orders = await Orders.find(filter)
+    const legacyOrders = await Orders.find(filter)
       .populate({ path: "items.product", select: "name title price selling_price product_image" })
       .populate({ path: "address" })
       .sort({ createdAt: -1 })
       .lean();
-    return res.status(200).json({ status: true, orders });
+
+    const normalizedLegacyOrders = legacyOrders.map((order) => ({
+      ...order,
+      _source: "legacy",
+    }));
+
+    return res.status(200).json({ status: true, orders: normalizedLegacyOrders });
   } catch (error) {
     console.error("getUserOrders error:", error);
     return res.status(500).json({ status: false, message: "Failed to load orders" });
@@ -395,26 +1252,60 @@ export const createOrder = async (req, res) => {
       return res.status(400).json({ status: false, message: "Items required" });
     }
 
+    const toPositive = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    };
+
+    const normalizedItems = items.map((item) => ({
+      raw: item,
+      productId: Number(item?.product_id ?? item?.productId ?? 0),
+      qty: Math.max(1, Number(item?.quantity ?? item?.qty ?? 1) || 1),
+      fallbackPrice: toPositive(item?.price ?? item?.selling_price ?? item?.mrp),
+    }));
+
     // fetch product prices
-    const ids = items.map((i) => Number(i.product_id)).filter(Boolean);
+    const ids = normalizedItems.map((i) => i.productId).filter((id) => Number.isFinite(id) && id > 0);
+    if (!ids.length) {
+      return res.status(400).json({ status: false, message: "No valid product ids found" });
+    }
     const products = await Products.find({ product_id: { $in: ids } }).lean();
     const productMap = new Map(products.map((p) => [p.product_id, p]));
 
     let amountPaise = 0;
     const orderItems = [];
-    for (const it of items) {
-      const prod = productMap.get(Number(it.product_id));
-      const price = prod ? Number(prod.selling_price || prod.price || 0) : 0;
-      const qty = Number(it.quantity) || 1;
-      amountPaise += Math.max(price, 0) * qty * 100;
+    for (const item of normalizedItems) {
+      const prod = productMap.get(item.productId);
+      const catalogPrice = toPositive(prod?.selling_price ?? prod?.price ?? prod?.mrp);
+      const unitPrice = catalogPrice || item.fallbackPrice;
+
+      if (!unitPrice) {
+        return res.status(400).json({
+          status: false,
+          message: `Unable to determine price for product ${item.productId}`,
+        });
+      }
+
+      amountPaise += Math.round(unitPrice * item.qty * 100);
       orderItems.push({
-        product_id: it.product_id,
-        quantity: qty,
-        price,
+        product_id: item.productId,
+        quantity: item.qty,
+        price: unitPrice,
         product: prod?._id,
+        title: String(item.raw?.title || prod?.title || prod?.name || "Product").trim(),
+        image: String(
+          item.raw?.image ||
+          (Array.isArray(prod?.product_image) ? prod?.product_image?.[0] : prod?.product_image) ||
+          ""
+        ).trim(),
+        color: String(item.raw?.color || "").trim(),
+        size: String(item.raw?.size || "").trim(),
       });
     }
-    if (!amountPaise) amountPaise = 100;
+
+    if (!orderItems.length || amountPaise <= 0) {
+      return res.status(400).json({ status: false, message: "Unable to price cart items" });
+    }
 
     const payload = {
       amount: Math.round(amountPaise),
@@ -444,27 +1335,15 @@ export const createOrder = async (req, res) => {
       ? await Addresses.findOne({ address_id: Number(address_id) })
       : null;
 
-    const localOrderId = await getNextSequence("order_id");
-    await Orders.create({
-      order_id: localOrderId,
-      status: "pending",
-      payment_status: "created",
-      payment_method: "Razorpay",
-      amount: payload.amount,
-      currency: payload.currency,
-      razorpay_order_id: order.id,
-      items: orderItems,
-      address: addressDoc?._id,
-      user_email: email || "",
-      FullName: addressDoc?.FullName || addressDoc?.full_name || "",
-      phone1: addressDoc?.phone1 || addressDoc?.phone || "",
-      phone2: addressDoc?.phone2 || addressDoc?.alt_phone || "",
-      address_line1: addressDoc?.address_line1 || addressDoc?.address || "",
-      city: addressDoc?.city || "",
-      state: addressDoc?.state || "",
-      country: addressDoc?.country || "",
-      pinCode: addressDoc?.pinCode || addressDoc?.postal_code || "",
-      addressType: addressDoc?.addressType || "",
+    const publicOrderId = await generateUniquePublicOrderId();
+    const { collectionName } = await insertTenantOrder({
+      req,
+      publicOrderId,
+      razorpayOrder: order,
+      payload,
+      orderItems,
+      addressDoc,
+      email,
     });
 
     return res.status(200).json({
@@ -473,7 +1352,9 @@ export const createOrder = async (req, res) => {
       key: keyId,
       amount: payload.amount,
       currency: payload.currency,
-      local_order_id: localOrderId,
+      local_order_id: publicOrderId,
+      source: "tenant",
+      collection: collectionName,
     });
   } catch (error) {
     console.error("createOrder error:", error);
@@ -494,6 +1375,23 @@ export const confirmPayment = async (req, res) => {
       .digest("hex");
     if (generatedSignature !== razorpay_signature) {
       return res.status(400).json({ status: false, message: "Signature mismatch" });
+    }
+
+    const tenantUpdate = await markTenantOrderPaymentCaptured({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
+    if (tenantUpdate?.order) {
+      const tenantOrderId = String(
+        tenantUpdate.order?.order_id ?? tenantUpdate.order?.orderId ?? ""
+      ).trim();
+      return res.status(200).json({
+        status: true,
+        message: "Payment verified",
+        order_id: tenantOrderId || undefined,
+        source: "tenant",
+      });
     }
 
     const order = await Orders.findOne({ razorpay_order_id });
@@ -638,6 +1536,19 @@ export const cancelOrder = async (req, res) => {
     const idStr = order_id || id;
     if (!idStr) {
       return res.status(400).json({ status: false, message: "order_id required" });
+    }
+
+    const tenantCancel = await cancelTenantOrderIfExists(idStr);
+    if (tenantCancel?.blocked) {
+      return res.status(400).json({ status: false, message: tenantCancel.message });
+    }
+    if (tenantCancel?.order) {
+      return res.status(200).json({
+        status: true,
+        message: "Order cancelled",
+        order: normalizeTenantOrderDoc(tenantCancel.order),
+        source: "tenant",
+      });
     }
 
     // Match either numeric order_id or Mongo _id
